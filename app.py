@@ -282,7 +282,20 @@ def _remove_with_retry(path, attempts=10, delay=0.2):
                 raise
             time.sleep(delay)
 
+# At most this many renders run at once. Each _render_clip() spawns an ffmpeg
+# libx264 re-encode and reads whole segment files into memory, so an unbounded
+# burst of kills (or boot-time reconstruction racing live saves) could exhaust
+# CPU/RAM. Extra callers block on the semaphore until a slot frees up.
+MAX_CONCURRENT_RENDERS = 2
+_render_semaphore = threading.BoundedSemaphore(MAX_CONCURRENT_RENDERS)
+
+
 def _render_clip(audio_paths, video_paths, name, beginrelative, endrelative):
+    with _render_semaphore:
+        _render_clip_inner(audio_paths, video_paths, name, beginrelative, endrelative)
+
+
+def _render_clip_inner(audio_paths, video_paths, name, beginrelative, endrelative):
     unique = f"{name}_{os.getpid()}_{threading.get_ident()}"
     audio_tmp = os.path.join(TEMPPATH, f".tmp_audio_{unique}.mp4")
     video_tmp = os.path.join(TEMPPATH, f".tmp_video_{unique}.mp4")
@@ -428,6 +441,215 @@ def save_clip_buffer(start, end, desiredname,clipno):
     print("saving",desiredname)
     save_clip(start,end,desiredname)
     return desiredname , end - start - aftercliptime
+
+
+# ---------------------------------------------------------------------------
+# Crash recovery: rebuild clips whose render was interrupted
+#
+# _render_clip runs ffmpeg with -y directly onto the final output path and only
+# writes the duration cache on its very last line, so if the server dies while a
+# clip is rendering we're left with a DB row (written by logakill) but a missing
+# or truncated .mp4. On the next boot reconstruct_missing_clips() spots those and
+# recreates them straight from the database + the DASH snippets still on disk.
+#
+# The in-memory `histories` used by the live path is gone after a reboot, so
+# segment timing is rebuilt from chunk-file mtimes instead. This mirrors
+# record_segment() exactly: each chunk "ends" when it lands on disk (its mtime)
+# and "starts" where the previous chunk ended.
+# ---------------------------------------------------------------------------
+
+WATCH_DIR_WAIT_SECONDS = 30  # give the network mount a moment to come up on boot
+
+
+def _is_clip_name(name):
+    """A real clip name is "{weapon}_{localisattacker}_{timestamp}_{clipno}".
+
+    Filters out the occasional garbage row (e.g. name "0") produced by the
+    merge-buffer race in save_clip_buffer, which has no clip to rebuild."""
+    if not isinstance(name, str) or not name:
+        return False
+    parts = name.rsplit("_", 2)
+    if len(parts) != 3:
+        return False
+    _, ts_part, clipno_part = parts
+    try:
+        float(ts_part)
+        int(clipno_part)
+    except ValueError:
+        return False
+    return True
+
+
+def _chunk_seq(name):
+    # chunk-stream1-{seq}.m4s -> seq (int) for ordering the concat correctly
+    try:
+        return int(name.rsplit("-", 1)[1].split(".", 1)[0])
+    except (IndexError, ValueError):
+        return None
+
+
+def _session_dir_segments(session_dir):
+    """Rebuild [start, end] timing for every audio chunk in one recording-session
+    dir from file mtimes, ordered by DASH sequence number so the concat order is
+    always correct even if mtimes are non-monotonic. Mirrors record_segment():
+    a chunk's end is its own mtime, its start is the previous chunk's end."""
+    try:
+        names = os.listdir(session_dir)
+    except OSError:
+        return []
+    audio = []
+    for n in names:
+        full = os.path.join(session_dir, n)
+        if not is_target(full):
+            continue
+        seq = _chunk_seq(n)
+        if seq is None:
+            continue
+        try:
+            mtime = os.stat(full).st_mtime
+        except OSError:
+            continue
+        audio.append((seq, full, mtime))
+    audio.sort(key=lambda x: x[0])
+
+    segs = []
+    prev_end = None
+    for _seq, full, mtime in audio:
+        start = prev_end if prev_end is not None else mtime
+        segs.append({"path": full, "start": start, "end": mtime})
+        prev_end = mtime
+    return segs
+
+
+def _matches_for_window(segs, start_ts, end_ts):
+    # same overlap test the live save_clip() uses to pick covering segments
+    return [s for s in segs if s["end"] > start_ts and s["start"] < end_ts]
+
+
+def _find_segments_for_clip(start_ts, end_ts):
+    """Scan every recording-session dir under WATCH_DIR and return the matching
+    audio segments from the dir that best covers [start_ts, end_ts], or [] if the
+    required snippets are no longer on disk (chunks rotated away / mount gone)."""
+    try:
+        entries = os.listdir(WATCH_DIR)
+    except OSError as e:
+        print(f"reconstruct: watch dir {WATCH_DIR} unavailable ({e})")
+        return []
+
+    best, best_cov = [], 0.0
+    for d in entries:
+        session_dir = os.path.join(WATCH_DIR, d)
+        if not os.path.isdir(session_dir):
+            continue
+        matches = _matches_for_window(_session_dir_segments(session_dir), start_ts, end_ts)
+        if not matches:
+            continue
+        # coverage = how much of the requested window this session actually spans
+        cov = max(0.0, min(matches[-1]["end"], end_ts) - max(matches[0]["start"], start_ts))
+        if cov > best_cov:
+            best, best_cov = matches, cov
+    return best
+
+
+def _wait_for_watch_dir():
+    deadline = time.time() + WATCH_DIR_WAIT_SECONDS
+    while time.time() < deadline:
+        try:
+            os.listdir(WATCH_DIR)
+            return True
+        except OSError:
+            time.sleep(1.0)
+    return False
+
+
+def _clip_is_complete(name):
+    """True if {name}.mp4 already exists as a fully-rendered file. Uses the
+    duration cache (written on _render_clip's last line) so we don't ffprobe the
+    hundreds of good clips on every boot - only files missing from the cache get
+    probed, and a valid one is cached so the next boot skips it too."""
+    out = VIDEOS_DIR / f"{name}.mp4"
+    try:
+        if not out.exists() or out.stat().st_size == 0:
+            return False
+        cached = get_cached_duration(f"{name}.mp4", out.stat().st_mtime)
+        if cached is not None:
+            return cached > 0
+        duration = get_video_duration(out)
+        if duration and duration > 0:
+            set_cached_duration(f"{name}.mp4", duration, int(out.stat().st_mtime))
+            return True
+        return False  # exists but ffprobe found no valid stream -> truncated render
+    except OSError:
+        return False
+
+
+def reconstruct_missing_clips():
+    """On boot, re-render any clip whose DB rows exist but whose output .mp4 is
+    missing or was left truncated by a crash mid-render.
+
+    Every kill event that was merged into a clip shares that clip's name in the
+    videos table, so grouping rows by name reproduces the merge-close-together
+    grouping for free; the clip window is then rebuilt from the group's kill
+    timestamps (min - beforecliptime .. max + aftercliptime) exactly as
+    save_clip_buffer/save_clip would have produced it."""
+    try:
+        conn = sqlite3.connect(str(DB_PATH), timeout=10.0)
+        c = conn.cursor()
+        try:
+            rows = c.execute("SELECT name, timestamp FROM videos").fetchall()
+        except sqlite3.OperationalError:
+            rows = []
+        conn.close()
+    except Exception as e:
+        print(f"reconstruct: cannot read database ({e})")
+        return
+
+    groups = defaultdict(list)
+    for name, ts in rows:
+        if not _is_clip_name(name):
+            continue
+        try:
+            groups[name].append(float(ts))
+        except (TypeError, ValueError):
+            continue
+
+    # Only the clips whose output is actually missing/broken need rebuilding.
+    todo = []
+    for name, timestamps in groups.items():
+        if _clip_is_complete(name):
+            continue
+        start_ts = min(timestamps) - beforecliptime
+        end_ts = max(timestamps) + aftercliptime
+        todo.append((name, start_ts, end_ts))
+
+    if not todo:
+        print("reconstruct: no interrupted clips to rebuild")
+        return
+
+    print(f"reconstruct: {len(todo)} clip(s) missing an output, checking snippets")
+    if not _wait_for_watch_dir():
+        print(f"reconstruct: {WATCH_DIR} never became available, giving up")
+        return
+
+    rebuilt = 0
+    for name, start_ts, end_ts in todo:
+        try:
+            matches = _find_segments_for_clip(start_ts, end_ts)
+            if not matches:
+                print(f"reconstruct: snippets no longer on disk for {name}, skipping")
+                continue
+            audio_paths = [s["path"] for s in matches]
+            video_paths = [getvideo(p) for p in audio_paths]
+            clip_start = matches[0]["start"]
+            beginrelative = start_ts - clip_start
+            endrelative = end_ts - clip_start
+            print(f"reconstruct: rebuilding {name}")
+            _render_clip(audio_paths, video_paths, name, beginrelative, endrelative)
+            rebuilt += 1
+        except Exception as e:
+            print(f"reconstruct: failed to rebuild {name}: {e}")
+    print(f"reconstruct: rebuilt {rebuilt}/{len(todo)} clip(s)")
+
 
 def get_video_duration(video_path):
     """Get video duration using ffprobe"""
@@ -762,6 +984,9 @@ if __name__ == '__main__':
     
     print("Initializing database...")
     init_db()
+    # Recover any clip whose render was interrupted by a previous crash before
+    # we start accepting new kills / recording new segments.
+    threading.Thread(target=reconstruct_missing_clips, daemon=True).start()
     threading.Thread(target=main,daemon=True).start()
     print("Starting Waitress server on http://0.0.0.0:5000")
     serve(app, host='0.0.0.0', port=5000, threads=60,connection_limit=5000)
