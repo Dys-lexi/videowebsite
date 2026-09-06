@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Videos</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            padding: 10px;
+        }
+
+        .date-group {
+            margin-bottom: 20px;
+        }
+
+        .date-label {
+            font-family: Arial, Helvetica, sans-serif;
+            font-size: 16px;
+            color: #cccccc;
+            margin-bottom: 8px;
+            font-weight: bold;
+        }
+
+        .date-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+
+        .video-card {
+            width: 250px;
+            background: #f5f5f5;
+            border: 1px solid #ddd;
+            cursor: pointer;
+        }
+
+        .video-card:hover {
+            background: #fff;
+            border-color: #999;
+        }
+
+        .thumbnail-container {
+            position: relative;
+            width: 100%;
+            padding-top: 56.25%;
+            background: #ddd;
+            overflow: hidden;
+        }
+
+        .thumbnail {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+
+        .play-overlay {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            width: 50px;
+            height: 50px;
+            background: rgba(0, 0, 0, 0.6);
+            display: none;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .video-card:hover .play-overlay {
+            display: flex;
+        }
+
+        .play-icon {
+            width: 0;
+            height: 0;
+            border-left: 15px solid white;
+            border-top: 10px solid transparent;
+            border-bottom: 10px solid transparent;
+            margin-left: 3px;
+        }
+
+        .timestamp {
+            position: absolute;
+            top: 5px;
+            left: 5px;
+            background: rgba(0, 0, 0, 0.7);
+            color: white;
+            padding: 3px 6px;
+            font-family: Arial, Helvetica, sans-serif;
+            font-size: 11px;
+        }
+
+        .duration {
+            position: absolute;
+            bottom: 5px;
+            left: 5px;
+            background: rgba(0, 0, 0, 0.7);
+            color: white;
+            padding: 3px 6px;
+            font-family: Arial, Helvetica, sans-serif;
+            font-size: 11px;
+        }
+
+        .copy-button {
+            position: absolute;
+            bottom: 5px;
+            right: 5px;
+            border:none;
+            background: rgba(0, 0, 0, 0.7);
+            color: white;
+            padding: 3px 6px;
+            font-family: Arial, Helvetica, sans-serif;
+            font-size: 11px;
+            display: flex;
+            justify-content: center;
+            width:20px;
+        }
+
+        .copy-button:hover {
+            background: rgba(0, 0, 0, 0.9);
+        }
+        .copy-button:active{
+            color: rgb(100,255,100)
+        }
+
+        .modal {
+            display: none;
+            position: fixed;
+            z-index: 1000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.85);
+            align-items: center;
+            justify-content: center;
+        }
+
+        .modal.active {
+            display: flex;
+        }
+
+        .modal-content {
+            position: relative;
+            max-width: 90%;
+            max-height: 90%;
+        }
+
+        .modal video {
+            max-width: 100%;
+            max-height: 90vh;
+            background: #000;
+        }
+
+        .close-modal {
+            position: absolute;
+            top: -35px;
+            right: 0;
+            color: white;
+            font-size: 30px;
+            cursor: pointer;
+            background: none;
+            border: none;
+            padding: 0;
+        }
+
+        .close-modal:hover {
+            color: #ccc;
+        }
+
+        @media (max-width: 768px) {
+            .video-card {
+                width: 180px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <h1 class="date-label" style = "font-size: 20px;">Lexi's <tag style="color: rgb(200,100,100);">miserable</tag> deaths :) (and kills)</h1>
+    {% if grouped_videos %}
+        {% for date, videos in grouped_videos %}
+        <div class="date-group">
+            <div class="date-label">{{ date }}</div>
+            <div class="date-row">
+                {% for video in videos[::-1]%}
+                <div class="video-card" onclick="playVideo('{{ video.path }}')">
+                    <div class="thumbnail-container">
+                        <img src="/thumbnail/{{ video.path }}"
+                             alt=""
+                             class="thumbnail"
+                             loading="lazy">
+                        <div class="timestamp">{{ video.mtime | int | timestamp }}</div>
+                        <div class="duration">{{ "%.2f"|format(video.duration) }}s</div>
+                        <button class="copy-button" onclick="event.stopPropagation(); copyVideoLink(this, '{{ video.path }}')">📋</button>
+                        <div class="play-overlay">
+                            <div class="play-icon"></div>
+                        </div>
+                    </div>
+                </div>
+                {% endfor %}
+            </div>
+        </div>
+        {% endfor %}
+    {% endif %}
+
+    <div class="modal" id="videoModal" onclick="closeModal(event)">
+        <div class="modal-content">
+            <button class="close-modal" onclick="closeModal(event)">&times;</button>
+            <video id="modalVideo" controls></video>
+        </div>
+    </div>
+
+    <script>
+        // Generate random pixel background
+        const colors = [
+            [10, 10, 20],
+            [20, 10, 10],
+            [10, 20, 10],
+            [10, 10, 10]
+        ];
+
+        // Generate 10 different patterns
+        const patterns = [];
+        const size = 50;
+        const count = 10
+        for (let i = 0; i < count; i++) {
+            const pattern = [];
+            for (let y = 0; y < size; y++) {
+                const row = [];
+                for (let x = 0; x < size; x++) {
+                    row.push(Math.floor(Math.random() * colors.length));
+                }
+                pattern.push(row);
+            }
+            patterns.push(pattern);
+        }
+
+        // Create a larger canvas using all 10 patterns randomly
+        const bigCanvas = document.createElement('canvas');
+        bigCanvas.width = size * 10;
+        bigCanvas.height = size * 10;
+        const bigCtx = bigCanvas.getContext('2d');
+
+        for (let ty = 0; ty < 10; ty++) {
+            for (let tx = 0; tx < 10; tx++) {
+                const pattern = patterns[Math.floor(Math.random() * patterns.length)];
+                for (let y = 0; y < size; y++) {
+                    for (let x = 0; x < size; x++) {
+                        const colorIndex = pattern[y][x];
+                        const color = colors[colorIndex];
+                        bigCtx.fillStyle = `rgb(${color[0]}, ${color[1]}, ${color[2]})`;
+                        bigCtx.fillRect(tx * size + x, ty * size + y, 1, 1);
+                    }
+                }
+            }
+        }
+
+        document.body.style.backgroundImage = `url(${bigCanvas.toDataURL()})`;
+        document.body.style.backgroundRepeat = 'repeat';
+
+        function playVideo(path) {
+            const modal = document.getElementById('videoModal');
+            const video = document.getElementById('modalVideo');
+            video.src = '/video/' + path;
+            modal.classList.add('active');
+            video.play();
+        }
+
+        function closeModal(event) {
+            if (event.target.id === 'videoModal' || event.target.classList.contains('close-modal')) {
+                const modal = document.getElementById('videoModal');
+                const video = document.getElementById('modalVideo');
+                video.pause();
+                video.src = '';
+                modal.classList.remove('active');
+            }
+        }
+
+        function copyVideoLink(button, path) {
+            const encodedPath = encodeURIComponent(path).replace(/%2F/g, '/');
+            const url = window.location.origin + '/video/' + encodedPath;
+            navigator.clipboard.writeText(url).then(() => {
+                button.textContent = '✓';
+                setTimeout(() => {
+                    button.textContent = '📋';
+                }, 1000);
+            }).catch(err => {
+                console.error('Failed to copy link:', err);
+            });
+        }
+
+        document.addEventListener('keydown', function(event) {
+            if (event.key === 'Escape') {
+                closeModal({target: document.getElementById('videoModal')});
+            }
+        });
+    </script>
+</body>
+</html>

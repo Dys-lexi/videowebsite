@@ -1,0 +1,33 @@
+
+services:
+  videoserve:
+    build: .
+    ports:
+      - "34253:5000"
+    volumes:
+      - /mnt/bigdrives/videopublishtitanfall:/app/videos:rw
+      - /mnt/bigdrives/videopublishthumbnailstitanfall:/app/thumbs:rw
+      - type: bind
+        source: /mnt/gamerecordings/video
+        target: /app/vids
+        read_only: true
+        bind:
+          propagation: rshared
+      - ./templates:/app/templates:ro
+      - ./app.py:/app/app.py:ro
+      - ./data:/app/data
+    environment:
+      - FLASK_ENV=development
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+  videofront:
+    ports:
+      - "34254:3000"
+    build:
+      context: ./fronty
+      dockerfile: ./dockerfile
+      args:
+        VITE_API_URL: http://videoserve:5000                                                                                                                                                                                                                   
+    # depends_on:                                                                                                                                                                                                                                   
+    #   - search                                                                                                                                                                                                                                                                                                                                                                                                                                                                
+    restart: unless-stopped

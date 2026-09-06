@@ -1,0 +1,31 @@
+
+
+# Runner stage: minimal runtime image with compiled app and production deps.
+FROM node:24-alpine3.23
+
+ENV PATH=/app/node_modules/.bin:$PATH
+
+WORKDIR /app
+
+# Copy package files first
+COPY package*.json ./
+
+# Install production dependencies only
+RUN npm i
+
+# Copy config files and source
+COPY . .
+
+# Build argument for API URL
+ARG VITE_API_URL=http://localhost:3440
+
+# Set as env var for build
+ENV VITE_API_URL=$VITE_API_URL
+
+RUN npm run build
+
+# Expose the port that the application listens on.
+EXPOSE 3000
+
+# Run the application.
+CMD ["node", "build/index.js"]
