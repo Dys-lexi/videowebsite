@@ -2,8 +2,14 @@
 	import { getFrontendUrl } from '$lib/things/config';
 	import type { Video, Coolfunfacts } from '$lib/things/types';
 	let { data } = $props();
+	import { durations } from '$lib/things/remote/data.remote';
 	import Hover from '$lib/things/followingmouse.svelte';
 	let videos = $derived(data.videos);
+		import { onMount } from 'svelte';
+
+	let durationvars = $derived(data.durations)
+	// let durationvars = durations()
+
 	let FRONTEND_URL = $derived(getFrontendUrl(page.url.origin));
 	import './page.css';
 	import { page } from '$app/state';
@@ -90,12 +96,12 @@
 />
 
 <div class="videosholder">
-	{#each datething as [date, videos]}
+	{#each datething as [date, videos] (date)}
 		<div class="dateholder">
 			<div class="date-label">{date}</div>
 
 			<div class="videoholder">
-				{#each videos as video}
+				{#each videos as video (video.name)}
 					<div
 						class="bleh"
 						role="presentation"
@@ -125,7 +131,11 @@
 							</div>
 							<div class="timestamp">{new Date(video.timetaken * 1000).toLocaleTimeString()}</div>
 							<!-- {console.log(video.duration)} -->
-							<div class="duration">{video.duration}</div>
+							 {#await durationvars} <div class="duration">{  "--:--"} </div>{:then duration}
+							 
+							<div class="duration">{duration?.durations[video.name] ?? "--:--"} </div>
+							
+							{/await}
 						</button>
 						<!-- svelte-ignore a11y_consider_explicit_label -->
 						<button onclick={() => playVideo(video.name)} class="play-overlay">
@@ -144,14 +154,14 @@
 											{#each detail as event}
 												{#if !event.error}
 													<div class="killholder">
-														<div class="killer">{event.attacker}</div>
+														<div class={event.localisattacker ? "killer": "victim"}>{event.attackername}</div>
 														<img
 															class="gun"
-															src={`gunimages/${event.weapon}.png`}
-															alt={`${event.weapon}`}
+															src={`gunimages/${event.attackerweaponname}.png`}
+															alt={`${event.attackerweaponname}`}
 														/>
 
-														<div class="victim">{event.victim}</div>
+														<div class={event.localisattacker ? "victim": "killer"}>{event.victimname}</div>
 													</div>
 												{:else}
 													missing damage info :(

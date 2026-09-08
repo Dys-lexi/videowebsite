@@ -1,6 +1,7 @@
 import type { Video } from "$lib/things/types";
 import { API_URL } from '$lib/things/config';
 import type { PageServerLoad } from './$types';
+import { durations } from '$lib/things/remote/data.remote';
 export const load: PageServerLoad = async ({ fetch }) => {
 	let videos = [] as Array<Video>;
 	let response;
@@ -12,5 +13,7 @@ export const load: PageServerLoad = async ({ fetch }) => {
 	} catch {
 		return { videos, statuscode: 500 };
 	}
-	return { videos, statuscode: response.status };
+	return { videos, statuscode: response.status, durations: durations() };
 };
+
+

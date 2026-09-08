@@ -32,6 +32,30 @@ export const thumbnail = query(v.string(), async (url) => {
 });
 
 
+export const durations = query(async () => {
+	let status = 500;
+
+    try {
+        // console.log(`${API_URL}/thumbnail/${url}`)
+		const response = await fetch(`${API_URL}/durations`, {
+			method: 'GET'
+		});
+
+		status = response.status;
+
+		if (!response.ok) {
+            return { durations: null, statuscode: status };
+		}
+  
+		// console.log(await response.json())
+
+		return { durations: (await response.json()), statuscode: status };
+	} catch {
+        return { durations: null, statuscode: status };
+	}
+});
+
+
 export const getmoredetail = query(v.string(), async (url) => {
 	let status = 500;
 
