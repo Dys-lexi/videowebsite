@@ -32,6 +32,32 @@ export const thumbnail = query(v.string(), async (url) => {
 });
 
 
+export const morevideos =  query(v.number(), async (mostrecentindex) => {
+	let status = 500;
+
+    try {
+        // console.log(`${API_URL}/thumbnail/${url}`)
+		const response = await fetch(`${API_URL}/videonames`, {
+			method: 'POST',
+						body: JSON.stringify({ mostrecentindex }),
+				headers: { 'Content-Type': 'application/json' }
+		});
+
+		status = response.status;
+
+		if (!response.ok) {
+            return { videos: [], statuscode: status };
+		}
+  
+		// console.log(await response.json())
+
+		return { videos: (await response.json()), statuscode: status };
+	} catch {
+        return { videos: [], statuscode: status };
+	}
+});
+
+
 export const durations = query(async () => {
 	let status = 500;
 

@@ -1,21 +1,60 @@
 <script lang="ts">
 	import { getFrontendUrl } from '$lib/things/config';
 	import type { Video, Coolfunfacts } from '$lib/things/types';
+	import {videodb} from '$lib/things/store';
 	let { data } = $props();
-	import { durations } from '$lib/things/remote/data.remote';
-	import Hover from '$lib/things/followingmouse.svelte';
-	let videos = $derived(data.videos);
-		import { onMount } from 'svelte';
+			 const storedVideos = liveQuery(() =>
+      videodb.video.toArray()
+    );
 
+    let likedNames = $derived.by( () => {
+      return new Set(
+        ($storedVideos ?? []).filter((video) => video.liked).map((video) => video.name)
+      )
+	});
+    let watched = $derived.by( () => {
+      return  ($storedVideos ?? []).filter((video) => video.watched?? 0 > 0).sort((a,b)=> (b.watched?? 0)  - (a.watched?? 0)).map((video) => video.name
+      )
+	});
+	 import { liveQuery } from "dexie";
+	import { durations,morevideos } from '$lib/things/remote/data.remote';
+	import Hover from '$lib/things/followingmouse.svelte';
+		async function togglelike(name: string) {
+		const existing = await videodb.video.get(name);
+	
+	await videodb.video.upsert(name,{
+		liked: !(existing?.liked ?? false)
+	}) 
+	}
+	let newvideos: Array<Video> = $state([])
+	let videos = $derived([...data.videos,...newvideos].sort((a,b) => b.id - a.id));
+		import { onMount } from 'svelte';
+	  import InfiniteLoading, { type StateChanger } from '$lib/things/infinite';
 	let durationvars = $derived(data.durations)
 	// let durationvars = durations()
+	async function loadmore(stateChanger: StateChanger) {
+		const justloaded: {statuscode:number,videos:Array<Video>} = await morevideos(videos.at(-1).id)
+		if (justloaded.statuscode == 200){
+			if (justloaded.videos.length == 0){
+				stateChanger.complete()
+				return
+			}
+			newvideos = [...newvideos,...justloaded.videos]
+			stateChanger.loaded();
+			return
+		}
 
+
+stateChanger.error();
+	
+	}
 	let FRONTEND_URL = $derived(getFrontendUrl(page.url.origin));
 	import './page.css';
 	import { page } from '$app/state';
 	import { browser } from '$app/environment';
-	import { Logo } from '$lib/things/const.svelte';
+	import { Logo, Star, Eye } from '$lib/things/const.svelte';
 	import { getmoredetail } from '$lib/things/remote/data.remote';
+	import { includes } from 'valibot';
 	let datething: Array<[string, Array<Video>]> = $derived.by(() => {
 		let groups = {} as Record<string, Array<Video>>;
 		for (const video of videos) {
@@ -40,8 +79,13 @@
 			: ''
 	);
 
-	function playVideo(path: string) {
+	async function playVideo(path: string) {
+		
 		playingVideo = path;
+		const existing = await videodb.video.get(path);
+		await videodb.video.upsert(path,{
+		watched: Math.floor(Date.now() / 1000) 
+	}) 
 	}
 
 	function closeModal() {
@@ -102,6 +146,7 @@
 
 			<div class="videoholder">
 				{#each videos as video (video.name)}
+	
 					<div
 						class="bleh"
 						role="presentation"
@@ -131,18 +176,24 @@
 							</div>
 							<div class="timestamp">{new Date(video.timetaken * 1000).toLocaleTimeString()}</div>
 							<!-- {console.log(video.duration)} -->
-							 {#await durationvars} <div class="duration">{  "--:--"} </div>{:then duration}
+							 {#await durationvars} <div class="duration hideme">{  "--:--"} </div>{:then duration}
 							 
-							<div class="duration">{duration?.durations[video.name] ?? "--:--"} </div>
+							<div class="duration hideme">{duration?.durations[video.name] ?? "--:--"} </div>
 							
 							{/await}
 						</button>
 						<!-- svelte-ignore a11y_consider_explicit_label -->
 						<button onclick={() => playVideo(video.name)} class="play-overlay">
-							<div class="play-icon"></div>
+							<div class="play-icon hideme"></div>
 						</button>
-						<button class="copy-button" onclick={(e) => copyVideoLink(e, video.name)}>
+						<button class="copy-button hideme" onclick={(e) => {copyVideoLink(e, video.name)}}>
 							{copiedPath === video.name ? '✓' : '📋'}
+						</button>
+								<button class="eye-button hideme" onclick={() => {togglelike( video.name)}}>
+							{@render Eye("none"  ,(watched.length > 0 && watched[0] == video.name)? "rgba(200,200,255,1)" : (watched.includes(video.name) ? "rgba(100,255,100,1)": "rgba(0,0,0,0.7)" ))}
+						</button>
+								<button class="like-button hideme" onclick={() => {togglelike( video.name)}}>
+							{@render Star("none"  ,likedNames.has(video.name)? "yellow": "rgba(0,0,0,0.7)" )}
 						</button>
 						{#if hoveringvideo === video.name}
 							<Hover>
@@ -199,3 +250,6 @@
 		{/if}
 	</div>
 </div>
+
+
+  <InfiniteLoading onInfinite={loadmore} distance = {500} />

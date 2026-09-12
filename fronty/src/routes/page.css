@@ -23,8 +23,13 @@
 	margin: 0;
 	border: none;
 	box-sizing: border-box;
+		height: 85px;
+	contain-intrinsic-size: auto 85px;
+	  content-visibility: auto;
 }
-
+.hideme{
+	  content-visibility: auto;
+}
 .video-card:hover {
 	/* background: #fff; */
 	border-color: #999;
@@ -54,7 +59,7 @@
 	transform: translate(-50%, -50%);
 	width: 30px;
 	height: 30px;
-	background: rgba(0, 0, 0, 0.6);
+background: rgba(0, 0, 0, 0.7);
 	display: none;
 	align-items: center;
 	justify-content: center;
@@ -111,6 +116,37 @@
 	width: 20px;
 }
 
+.like-button{
+		position: absolute;
+	top: 5px;
+	display: flex;
+	justify-content: center;
+	width: 20px;
+	height: 20px;
+	border: none;
+	right: 5px;
+	align-items: center;
+	background-color: rgba(0,0,0,0.25);
+	border-radius: 0px 50px  50px 0px;
+}
+.eye-button{
+		position: absolute;
+	top: 5px;
+	display: flex;
+	justify-content: center;
+	width: 20px;
+	height: 20px;
+	border: none;
+	right: 25px;
+	align-items: center;
+	background-color: rgba(0,0,0,0.25);
+	padding-left: 2px;
+	border-radius: 50px 0px 0px 50px;
+}
+.like-button:hover{
+	background-color:rgba(255,255,255,0.1);
+}
+
 .copy-button:hover {
 	background: rgba(0, 0, 0, 0.9);
 }
@@ -135,6 +171,7 @@
 	display: flex;
 }
 .bleh {
+
 	width: 100%;
 	height: fit-content;
 	position: relative;
@@ -178,7 +215,7 @@
 .videoholder{
    display: grid;
    grid-template-columns: repeat(auto-fill, 150px);
-   justify-content: space-between;
+   justify-content: space-around;
    row-gap: 5px;
    column-gap: 2px;
 }
@@ -188,7 +225,9 @@
 .dateholder{
     display: flex;
     flex-direction: column;
-    gap: 15px
+    gap: 15px;
+	
+  
 }
 
 .videosholder{

@@ -16,7 +16,7 @@
   import spyLogo from "$lib/images/spy.png";
   // import copylogo from "$lib/images/copy.svg";
 
-  export {  Logo};
+  export { Eye, Logo, Star };
 
   const logos = [ionLogo, toneLogo, legionLogo, scorchLogo, roninLogo, northstarLogo] as const;
   const fallbackLogo = logos[0];
@@ -41,6 +41,41 @@
         <img  src={logos[randomnumber%logos.length]} height={64} width={64} alt="" />
       </a>
     </div>
+{/snippet}
+
+{#snippet Star(backgroundColour: string, fillColour: string)}
+  <svg
+    xmlns="http://www.w3.org/2000/svg"
+    width="24"
+    height="24"
+    viewBox="0 0 24 24"
+    role="img"
+    aria-label="Favourite"
+  >
+    <rect width="24" height="24" rx="4" fill={backgroundColour} />
+    <path
+      fill={fillColour}
+      d="m12 2.75 2.78 5.63 6.22.9-4.5 4.39 1.06 6.2L12 16.94l-5.56 2.93 1.06-6.2L3 9.28l6.22-.9L12 2.75Z"
+    />
+  </svg>
+{/snippet}
+
+{#snippet Eye(backgroundColour: string, fillColour: string)}
+  <svg
+    xmlns="http://www.w3.org/2000/svg"
+    width="24"
+    height="24"
+    viewBox="0 0 24 24"
+    role="img"
+    aria-label="Watched"
+  >
+    <rect width="24" height="24" rx="4" fill={backgroundColour} />
+    <path
+      fill={fillColour}
+      fill-rule="evenodd"
+      d="M12 4.5C6.75 4.5 2.5 7.7 1 12c1.5 4.3 5.75 7.5 11 7.5s9.5-3.2 11-7.5c-1.5-4.3-5.75-7.5-11-7.5Zm0 4.5a3 3 0 1 0 0 6 3 3 0 1 0 0-6Z"
+    />
+  </svg>
 {/snippet}
 
 <!-- {#snippet ClassLogo(name: string)}

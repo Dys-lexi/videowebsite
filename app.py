@@ -44,6 +44,12 @@ histories_lock = threading.Lock()
 # server's clock before it's used to look up recorded video segments.
 clock_skew_lock = threading.Lock()
 clock_skew = None  # server_time - uploader_time, seconds
+# CIFS exposes the recorder's mtimes with the recorder's clock offset.  Learn
+# that offset from new chunks as they arrive so crash recovery can translate
+# their mtimes onto this server's Unix timeline.
+recording_clock_skew_lock = threading.Lock()
+recording_clock_skew = None  # server arrival time - recorder file mtime
+recording_clock_skew_ready = threading.Event()
 realprint = print
 
 DISALLOWED_COLOURS = (
@@ -207,12 +213,19 @@ def main():
                     print(f"watch: {WATCH_DIR} unavailable ({e})")
                     dirs = []
 
-                now = time.time()
+                # Compare directory mtimes with one another, not with this
+                # machine's clock.  The CIFS recorder can be an hour (or more)
+                # out, but its newest directory is still the active one.
+                dir_mtimes = []
                 for entry in dirs:
                     try:
                         mtime = entry.stat().st_mtime
                     except OSError:
                         continue
+                    dir_mtimes.append((entry, mtime))
+
+                newest_mtime = max((mtime for _entry, mtime in dir_mtimes), default=None)
+                for entry, mtime in dir_mtimes:
 
                     # Once a dir is baselined, its bookkeeping is kept for the
                     # life of the process (a growing set of filenames costs
@@ -221,7 +234,9 @@ def main():
                     # what's already been recorded, or a dir that goes quiet
                     # and later resumes gets silently re-baselined and its
                     # new segments never get recorded.
-                    if now - mtime > WATCH_ACTIVE_WINDOW_SECONDS and entry.path in known:
+                    if (newest_mtime is not None
+                            and newest_mtime - mtime > WATCH_ACTIVE_WINDOW_SECONDS
+                            and entry.path in known):
                         continue
 
                     is_new_dir = entry.path not in known
@@ -253,8 +268,22 @@ def main():
     except KeyboardInterrupt:
         print("\nstopped")
 def record_segment(path):
+    global recording_clock_skew
     parent = os.path.dirname(path)
     now = time.time()
+    try:
+        sample = now - os.stat(path).st_mtime
+    except OSError:
+        sample = None
+    if sample is not None:
+        # File creation/visibility latency can only increase the sample, so the
+        # running minimum is the closest estimate of the actual clock skew.
+        with recording_clock_skew_lock:
+            recording_clock_skew = (
+                sample if recording_clock_skew is None
+                else min(recording_clock_skew, sample)
+            )
+        recording_clock_skew_ready.set()
     with histories_lock:
         hist = histories.setdefault(parent, [])
         start = hist[-1]["end"] if hist else now
@@ -419,23 +448,28 @@ def save_clip(start_ts, end_ts, name):
         print(f"save_clip: no buffered segments cover {start_ts}-{end_ts}")
     return saved_any
 
-def save_clip_buffer(start, end, desiredname,clipno):
+def save_clip_buffer(start, end, desiredname,clipno,localisattacker):
     global clipdetails
     with histories_lock:
         clipdetails["end"] = max(clipdetails.get("end",end),end) 
         clipdetails["start"] = min(clipdetails.get("start",start) or start,start)
         clipdetails["name"] = clipdetails.get("name",desiredname) or desiredname
     # print(max(end+maxtimetomergemultipleclips - time.time(),0))
-    time.sleep(max(end+maxtimetomergemultipleclips - time.time(),0))
-    if clipdetails["clipno"] != clipno:
-        print("concatanting")
-        return clipdetails.get("name",desiredname),start - clipdetails["start"] + beforecliptime
+    if localisattacker: #avoid gluing together clips after a death
+        time.sleep(max(end+maxtimetomergemultipleclips - time.time(),0))
+        if clipdetails["clipno"] != clipno:
+            print("concatanting")
+            return clipdetails.get("name",desiredname),start - clipdetails["start"] + beforecliptime
+    else:
+        time.sleep(max(end+2 - time.time(),0))
+        if clipdetails["clipno"] != clipno:
+            print("concatanting")
+            return clipdetails.get("name",desiredname),start - clipdetails["start"] + beforecliptime
     # print("saving")
-    start =  min(clipdetails.get("start",start),start)
-    end = max(clipdetails.get("end",end),end) 
-    desiredname =  clipdetails.get("name",desiredname)
-
     with histories_lock:
+        start =  min(clipdetails.get("start",start),start)
+        end = max(clipdetails.get("end",end),end) 
+        desiredname =  clipdetails.get("name",desiredname)
         clipdetails["start"] = False
         clipdetails["name"] = False
     print("saving",desiredname)
@@ -497,6 +531,9 @@ def _session_dir_segments(session_dir):
         names = os.listdir(session_dir)
     except OSError:
         return []
+    with recording_clock_skew_lock:
+        mtime_skew = recording_clock_skew or 0.0
+
     audio = []
     for n in names:
         full = os.path.join(session_dir, n)
@@ -509,7 +546,7 @@ def _session_dir_segments(session_dir):
             mtime = os.stat(full).st_mtime
         except OSError:
             continue
-        audio.append((seq, full, mtime))
+        audio.append((seq, full, mtime + mtime_skew))
     audio.sort(key=lambda x: x[0])
 
     segs = []
@@ -631,6 +668,11 @@ def reconstruct_missing_clips():
         print(f"reconstruct: {WATCH_DIR} never became available, giving up")
         return
 
+    # Prefer a clock-skew sample from a newly-created chunk.  If recording is
+    # currently idle the wait expires and recovery falls back to raw mtimes.
+    if not recording_clock_skew_ready.wait(WATCH_DIR_WAIT_SECONDS):
+        print("reconstruct: no new chunk arrived to calibrate recorder mtimes")
+
     rebuilt = 0
     for name, start_ts, end_ts in todo:
         try:
@@ -705,13 +747,28 @@ def get_video_files():
 # print("eee")
 # get_video_files()
 # print("ooo")
-def get_video_files_names():
-    """Scan videos directory and return list of video files with metadata"""
-
+def getjustnames():
     if not VIDEOS_DIR.exists():
         return []
 
-    return list(map(lambda x: {"url":x.name,"name":x.name,"duration":f"{get_cached_duration(x.name,x.stat().st_mtime) or 0:.2f}","timetaken":int(x.stat().st_mtime)} ,VIDEOS_DIR.rglob("*")))
+    return list(map(lambda x: x.name ,VIDEOS_DIR.rglob("*"))) 
+
+def get_video_files_names(index,requestcount):
+    """Scan videos directory and return list of video files with metadata"""
+    if not index: return []
+    if not VIDEOS_DIR.exists():
+        return []
+    conn = sqlite3.connect(str(DB_PATH), timeout=10.0)
+    c = conn.cursor()
+    c.execute("SELECT MAX (id), MIN(timestamp) FROM videos")
+    neatthings = c.fetchone()
+    offset = not index + 1 and "0" or neatthings[0] -index
+    c.execute(f"SELECT name, MIN(timestamp) AS timestamp, MIN(id) AS id FROM videos GROUP BY name ORDER BY id DESC LIMIT {requestcount} OFFSET {offset}")
+    a = list(map(lambda x: {"url":x[0],"name":f"{x[0]}.mp4","timetaken":x[1],"id":x[2] },c.fetchall()))
+    if not a:
+        return list(filter(lambda x: int(x["timetaken"]) < float(neatthings[1]), map(lambda x: {"id":0,"url":x.name,"name":x.name,"timetaken":int(x.stat().st_mtime)} ,VIDEOS_DIR.rglob("*"))))
+        
+    return a
 
 def group_videos_by_date(videos):
     """Group videos by creation date"""
@@ -777,9 +834,11 @@ def detail(name):
     # print("meow",[name.rsplit(".",1)[0]])
     conn = sqlite3.connect(str(DB_PATH), timeout=10.0)
     c = conn.cursor()
+    columns = [row[1] for row in c.execute("PRAGMA table_info(videos)")]
+    # print(columns)
     try:
         c.execute(
-            "SELECT attackerweaponname, attackername,victimname FROM videos WHERE name = ?",
+            "SELECT * FROM videos WHERE name = ?",
             (name.rsplit(".",1)[0],)
         )
         rows = c.fetchall()
@@ -792,7 +851,7 @@ def detail(name):
         return {"data":None}
 
 
-    returnstuff = list(map(lambda x: {"weapon":x[0],"attacker":x[1],"victim":x[2],"error":not all(x)} ,rows))
+    returnstuff = list(map(lambda x: dict(zip(columns,x,strict = True)) ,rows))
     # print(returnstuff)
     return {"data":returnstuff}
 
@@ -813,13 +872,18 @@ def api_videos():
     return jsonify((result))
 
 
-@app.route('/videonames')
+@app.route('/videonames',methods = ["POST"])
 def api_videos_names():
+    
     """API endpoint returning videos grouped by date"""
-    return get_video_files_names()
+    return get_video_files_names(request.get_json()["mostrecentindex"],200)
 
 
-
+@app.route('/durations')
+def weeee():
+    # time.sleep(5)
+    return dict(map(lambda x: (x,f"{get_cached_duration(x,0) or 0:.2f}"), getjustnames()))
+    
 @app.route('/thumbnail/<path:video_path>')
 def thumbnail(video_path):
 
@@ -951,7 +1015,7 @@ def logakill():
     # query = sqlite3.connect("./database.db")
     # c = query.cursor()
     # columns = [row[1] for row in c.execute("PRAGMA table_info(videos)")]
-    stuff["name"],stuff["whereinclip"]  = save_clip_buffer(stuff["timestamp"] - beforecliptime, stuff["timestamp"] + aftercliptime,f"{stuff['attackerweaponname']}_{stuff['localisattacker']}_{stuff['timestamp']}_{clipno}",clipno)
+    stuff["name"],stuff["whereinclip"]  = save_clip_buffer(stuff["timestamp"] - beforecliptime, stuff["timestamp"] + aftercliptime,f"{stuff['attackerweaponname']}_{stuff['localisattacker']}_{int(stuff['timestamp'])}_{clipno}",clipno,stuff["localisattacker"])
     # resp = requests.post(f"{UPLOAD_URL}/db", json={"things":f"INSERT INTO videos ({", ".join(list(stuff.keys()))}) VALUES ({", ".join(["?"]*len(stuff))})","vars":stuff})
     dbinsert({"things":f"INSERT INTO videos ({', '.join(list(stuff.keys()))}) VALUES ({', '.join(['?']*len(stuff))})","vars":stuff})
     # print(f"sent a database entry for {stuff["name"]}")
