@@ -454,17 +454,19 @@ def save_clip_buffer(start, end, desiredname,clipno,localisattacker):
         clipdetails["end"] = max(clipdetails.get("end",end),end) 
         clipdetails["start"] = min(clipdetails.get("start",start) or start,start)
         clipdetails["name"] = clipdetails.get("name",desiredname) or desiredname
+        starttime = clipdetails["start"] 
+        name = clipdetails["name"]
     # print(max(end+maxtimetomergemultipleclips - time.time(),0))
     if localisattacker: #avoid gluing together clips after a death
         time.sleep(max(end+maxtimetomergemultipleclips - time.time(),0))
         if clipdetails["clipno"] != clipno:
             print("concatanting")
-            return clipdetails.get("name",desiredname),start - clipdetails["start"] + beforecliptime
+            return name,start - starttime + beforecliptime
     else:
         time.sleep(max(end+2 - time.time(),0))
         if clipdetails["clipno"] != clipno:
             print("concatanting")
-            return clipdetails.get("name",desiredname),start - clipdetails["start"] + beforecliptime
+            return name,start - starttime + beforecliptime
     # print("saving")
     with histories_lock:
         start =  min(clipdetails.get("start",start),start)
@@ -477,22 +479,9 @@ def save_clip_buffer(start, end, desiredname,clipno,localisattacker):
     return desiredname , end - start - aftercliptime
 
 
-# ---------------------------------------------------------------------------
-# Crash recovery: rebuild clips whose render was interrupted
-#
-# _render_clip runs ffmpeg with -y directly onto the final output path and only
-# writes the duration cache on its very last line, so if the server dies while a
-# clip is rendering we're left with a DB row (written by logakill) but a missing
-# or truncated .mp4. On the next boot reconstruct_missing_clips() spots those and
-# recreates them straight from the database + the DASH snippets still on disk.
-#
-# The in-memory `histories` used by the live path is gone after a reboot, so
-# segment timing is rebuilt from chunk-file mtimes instead. This mirrors
-# record_segment() exactly: each chunk "ends" when it lands on disk (its mtime)
-# and "starts" where the previous chunk ended.
-# ---------------------------------------------------------------------------
 
-WATCH_DIR_WAIT_SECONDS = 30  # give the network mount a moment to come up on boot
+
+WATCH_DIR_WAIT_SECONDS = 30  
 
 
 def _is_clip_name(name):
@@ -693,6 +682,125 @@ def reconstruct_missing_clips():
     print(f"reconstruct: rebuilt {rebuilt}/{len(todo)} clip(s)")
 
 
+# ---------------------------------------------------------------------------
+# One-shot repair for rows corrupted by the old save_clip_buffer death-race.
+#
+# When the local player died mid-clip, clipdetails["name"]/["start"] were reset
+# to False before an *earlier* kill in that same clip woke from its merge-sleep.
+# That kill was then written with name = False (stored as "0") and
+# whereinclip = start - False + beforecliptime, i.e. a raw unix timestamp.
+#
+# Every kill merged into one clip shares that clip's name and a common clip
+# start, and the name embeds the clip's first-kill timestamp. So a corrupted
+# row can be healed by finding a healthy row from the same clip and copying its
+# name across:
+#   * same clip == same recording session (timestamp - gametime is a constant
+#     per match: the match's real-world start) AND close together in timestamp
+#     (within the same aftercliptime + maxtimetomergemultipleclips merge window
+#     save_clip_buffer used to glue kills together).
+#   * whereinclip is then rebuilt as timestamp - clip_start + beforecliptime,
+#     where clip_start is the earliest timestamp across the whole clip (healthy
+#     rows *and* the rows being healed - a corrupted row is often the clip's
+#     own first kill, which is why its int timestamp is the one in the name).
+# The timings all come from config.json (beforecliptime / aftercliptime /
+# maxtimetomergemultipleclips), so this stays correct if they are retuned.
+# ---------------------------------------------------------------------------
+
+def repair_corrupted_clip_names():
+    # A match's (timestamp - gametime) is fixed; allow a little float/skew slack
+    # so two kills are judged same-session only if their offsets basically agree.
+    SESSION_OFFSET_TOL = 2.0
+    # Two kills merged into one clip are never further apart than the window
+    # save_clip_buffer waited before closing a clip.
+    MERGE_WINDOW = aftercliptime + maxtimetomergemultipleclips
+
+    def _num(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    try:
+        conn = sqlite3.connect(str(DB_PATH), timeout=10.0)
+        c = conn.cursor()
+        try:
+            rows = c.execute(
+                "SELECT id, name, timestamp, gametime, whereinclip FROM videos"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            conn.close()
+            print("repair: videos table has no rows to check")
+            return
+    except Exception as e:
+        print(f"repair: cannot open database ({e})")
+        return
+
+    healthy, corrupted = [], []
+    for rid, name, ts, gametime, whereinclip in rows:
+        t, g, w = _num(ts), _num(gametime), _num(whereinclip)
+        if t is None or g is None:
+            continue  # can't place a row on a timeline without both clocks
+        if _is_clip_name(name):
+            healthy.append((rid, name, t, g))
+        elif w is not None and w > 1e8:
+            # name isn't a real clip name and whereinclip is a unix-scale
+            # timestamp rather than a small in-clip offset -> the death-race row.
+            corrupted.append((rid, t, g))
+
+    if not corrupted:
+        conn.close()
+        print("repair: no corrupted clip-name rows found")
+        return
+
+    # For each corrupted row pick the nearest healthy kill from the same session.
+    assigned = {}   # row id -> clip name
+    orphans = []
+    for rid, t, g in corrupted:
+        offset = t - g
+        best_name, best_dist = None, None
+        for _hid, hname, ht, hg in healthy:
+            if abs((ht - hg) - offset) > SESSION_OFFSET_TOL:
+                continue
+            dist = abs(ht - t)
+            if best_dist is None or dist < best_dist:
+                best_name, best_dist = hname, dist
+        if best_name is None or best_dist > MERGE_WINDOW:
+            orphans.append(rid)  # lone death, no sibling kill to borrow a name from
+            continue
+        assigned[rid] = best_name
+
+    if not assigned:
+        conn.close()
+        print(f"repair: {len(corrupted)} corrupted row(s) but none had a sibling clip; left untouched")
+        return
+
+    # clip_start = earliest timestamp across the whole clip, including the rows
+    # we're about to heal (a corrupted row may be the clip's own first kill).
+    clip_start = {}
+    for _hid, hname, ht, _hg in healthy:
+        if hname not in clip_start or ht < clip_start[hname]:
+            clip_start[hname] = ht
+    ts_by_id = {rid: t for rid, t, _g in corrupted}
+    for rid, cname in assigned.items():
+        t = ts_by_id[rid]
+        if cname not in clip_start or t < clip_start[cname]:
+            clip_start[cname] = t
+
+    with db_lock:
+        for rid, cname in assigned.items():
+            whereinclip = ts_by_id[rid] - clip_start[cname] + beforecliptime
+            c.execute(
+                "UPDATE videos SET name = ?, whereinclip = ? WHERE id = ?",
+                (cname, whereinclip, rid),
+            )
+        conn.commit()
+    conn.close()
+
+    print(f"repair: healed {len(assigned)} corrupted clip-name row(s)")
+    if orphans:
+        print(f"repair: left {len(orphans)} orphan row(s) with no sibling clip untouched: {orphans}")
+
+
 def get_video_duration(video_path):
     """Get video duration using ffprobe"""
     try:
@@ -838,7 +946,7 @@ def detail(name):
     # print(columns)
     try:
         c.execute(
-            "SELECT * FROM videos WHERE name = ?",
+            "SELECT * FROM videos WHERE name = ? ORDER BY gametime",
             (name.rsplit(".",1)[0],)
         )
         rows = c.fetchall()
@@ -1048,6 +1156,9 @@ if __name__ == '__main__':
     
     print("Initializing database...")
     init_db()
+    # Heal any rows the old save_clip_buffer death-race wrote with a bogus
+    # name ("0") / unix-timestamp whereinclip before anything reads them.
+    repair_corrupted_clip_names()
     # Recover any clip whose render was interrupted by a previous crash before
     # we start accepting new kills / recording new segments.
     threading.Thread(target=reconstruct_missing_clips, daemon=True).start()

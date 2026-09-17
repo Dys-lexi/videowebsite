@@ -252,4 +252,4 @@ stateChanger.error();
 </div>
 
 
-  <InfiniteLoading onInfinite={loadmore} distance = {500} />
+  <InfiniteLoading onInfinite={loadmore} distance = {2000} />
